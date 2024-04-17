@@ -73,7 +73,7 @@ pub(super) fn counts_stream(
 
             if batch.is_empty() {
                 Err(anyhow::anyhow!(
-                    "No event counts found for range: start {start}, batch_size (batch_size)"
+                    "No event counts found for range: start {start}, batch_size {batch_size}"
                 ))?;
                 break;
             }
