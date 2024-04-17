@@ -24,6 +24,7 @@ use p2p_proto::{
 use pathfinder_common::{
     event::Event,
     state_update::{ContractClassUpdate, ContractUpdateCounts, ContractUpdates},
+    transaction::Transaction,
     SierraHash, TransactionHash,
 };
 use pathfinder_common::{
@@ -254,6 +255,109 @@ impl Client {
         self.inner
             .send_transactions_sync_request(peer, request)
             .await
+    }
+
+    pub fn transactions_stream(
+        self,
+        mut start: BlockNumber,
+        stop_inclusive: BlockNumber,
+        transaction_counts_stream: impl futures::Stream<Item = anyhow::Result<usize>>,
+    ) -> impl futures::Stream<Item = anyhow::Result<PeerData<TransactionsForBlock>>> {
+        async_stream::try_stream! {
+            pin_mut!(transaction_counts_stream);
+
+            let mut current_count_outer = None;
+
+            if start <= stop_inclusive {
+                // Loop which refreshes peer set once we exhaust it.
+                'outer: loop {
+                    let peers = self
+                        .get_update_peers_with_sync_capability(protocol::Transactions::NAME)
+                        .await;
+
+                    // Attempt each peer.
+                    'next_peer: for peer in peers {
+                        let limit = stop_inclusive.get() - start.get() + 1;
+
+                        let request = TransactionsRequest {
+                            iteration: Iteration {
+                                start: start.get().into(),
+                                direction: Direction::Forward,
+                                limit,
+                                step: 1.into(),
+                            },
+                        };
+
+                        let mut responses =
+                            match self.inner.send_transactions_sync_request(peer, request).await {
+                                Ok(x) => x,
+                                Err(error) => {
+                                    // Failed to establish connection, try next peer.
+                                    tracing::debug!(%peer, reason=%error, "Transactions request failed");
+                                    continue 'next_peer;
+                                }
+                            };
+
+                        let mut current_count = match current_count_outer {
+                            // Still the same block
+                            Some(backup) => backup,
+                            // Move to the next block
+                            None => {
+                                let x = transaction_counts_stream.next().await
+                                    .ok_or_else(|| anyhow::anyhow!("Transaction counts stream terminated prematurely at block {start}"))??;
+                                current_count_outer = Some(x);
+                                x
+                            }
+                        };
+
+                        let mut transactions = Vec::new();
+
+                        while let Some(contract_diff) = responses.next().await {
+                            match contract_diff {
+                                TransactionsResponse::Transaction(tx) => {
+                                    let tx = Transaction::try_from_dto(tx)?;
+                                    match current_count.checked_sub(1) {
+                                        Some(x) => current_count = x,
+                                        None => {
+                                            tracing::debug!(%peer, "Too many transactions");
+                                            // TODO punish the peer
+                                            continue 'next_peer;
+                                        }
+                                    }
+                                    transactions.push(tx);
+                                }
+                                TransactionsResponse::Fin => {
+                                    if current_count == 0 {
+                                        // The counter for this block has been exhausted which means
+                                        // that this block is complete.
+                                        yield PeerData::new(
+                                            peer,
+                                            (start, std::mem::take(&mut transactions)),
+                                        );
+
+                                        if start < stop_inclusive {
+                                            // Move to the next block
+                                            start += 1;
+                                            current_count = transaction_counts_stream.next().await
+                                                .ok_or_else(|| anyhow::anyhow!("Transaction counts stream terminated prematurely at block {start}"))??;
+                                            current_count_outer = Some(current_count);
+                                            tracing::debug!(%peer, "Transaction stream Fin");
+                                        } else {
+                                            // We're done, terminate the stream
+                                            break 'outer;
+                                        }
+                                    } else {
+                                        tracing::debug!(%peer, "Premature transaction stream Fin");
+                                        // TODO punish the peer
+                                        continue 'next_peer;
+                                    }
+                                }
+                            };
+                        }
+                    }
+                }
+            }
+        }
     }
 
     pub async fn send_receipts_sync_request(
@@ -735,5 +839,7 @@ impl Default for PeersWithCapability {
         Self::new(Duration::from_secs(60))
     }
 }
+
+pub type TransactionsForBlock = (BlockNumber, Vec<Transaction>);
 
 pub type EventsForBlockByTransaction = (BlockNumber, Vec<Vec<Event>>);
