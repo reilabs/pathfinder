@@ -88,12 +88,7 @@ pub enum TriePruneMode {
     Prune { num_blocks_kept: u64 },
 }
 
-type TransactionWithReceipt = (
-    StarknetTransaction,
-    Receipt,
-    Vec<pathfinder_common::event::Event>,
-    BlockNumber,
-);
+type TransactionWithReceipt = (StarknetTransaction, Receipt, Vec<Event>, BlockNumber);
 
 type TransactionDataForBlock = (StarknetTransaction, Receipt, Vec<Event>);
 

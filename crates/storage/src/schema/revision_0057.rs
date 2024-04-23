@@ -1,435 +1,171 @@
-//! Contains starknet transaction related code and __not__ database transaction.
+use std::{mem, sync::mpsc, thread, time::Duration};
 
 use anyhow::Context;
-use pathfinder_common::event::Event;
-use pathfinder_common::receipt::Receipt;
-use pathfinder_common::transaction::Transaction as StarknetTransaction;
-use pathfinder_common::{BlockHash, BlockNumber, TransactionHash};
+use rusqlite::params;
 
-use crate::{prelude::*, BlockId};
+pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
+    tracing::info!("Migrating starknet_transactions to new format");
 
-use super::{EventsForBlock, TransactionDataForBlock, TransactionWithReceipt};
-
-pub enum TransactionStatus {
-    L1Accepted,
-    L2Accepted,
-}
-
-type TransactionsRow = Vec<(StarknetTransaction, Option<Receipt>, Option<Vec<Event>>)>;
-
-impl Transaction<'_> {
-    /// Inserts the transaction, receipt and event data.
-    pub fn insert_transaction_data(
-        &self,
-        block_number: BlockNumber,
-        transaction_data: &[TransactionData],
-    ) -> anyhow::Result<()> {
-        if transaction_data.is_empty() {
-            return Ok(());
-        }
-
-        let mut insert_transaction_stmt = self
-            .inner()
-            .prepare(
-                "INSERT INTO transactions (block_number, transactions) VALUES (:block_number, :transactions)",
-            )
-            .context("Preparing insert transaction statement")?;
-        let mut insert_transaction_hash_stmt = self
-            .inner()
-            .prepare(
-                "INSERT INTO transaction_hashes (hash, block_number) VALUES (:hash, :block_number)",
-            )
-            .context("Preparing insert transaction hash statement")?;
-
-        for TransactionData { transaction, .. } in transaction_data.iter() {
-            insert_transaction_hash_stmt.execute(named_params![
-                ":hash": &transaction.hash,
-                ":block_number": &block_number,
-            ])?;
-        }
-
-        let transactions: Vec<_> = transaction_data
-            .iter()
-            .map(
-                |TransactionData {
-                     transaction,
-                     receipt,
-                     events,
-                 }: &TransactionData| {
-                    dto::TransactionsRow {
-                        transaction: dto::Transaction::from(transaction),
-                        receipt: receipt.as_ref().map(|x| dto::Receipt::from(x)),
-                        events: events.as_ref().map(|events| dto::Events::V0 {
-                            events: events.iter().map(|x| x.to_owned().into()).collect(),
-                        }),
-                    }
-                },
-            )
-            .collect();
+    let mut transformers = Vec::new();
+    let (insert_tx, insert_rx) = mpsc::channel();
+    let (transform_tx, transform_rx) =
+        flume::unbounded::<(i64, Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>)>();
+    for _ in 0..thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+    {
+        let insert_tx = insert_tx.clone();
+        let transform_rx = transform_rx.clone();
         let mut compressor = zstd::bulk::Compressor::new(10).context("Create zstd compressor")?;
-        let transactions =
-            bincode::serde::encode_to_vec(&transactions, bincode::config::standard())
-                .context("Serializing transaction")?;
-        let transactions = compressor
-            .compress(&transactions)
-            .context("Compressing transaction")?;
-
-        insert_transaction_stmt
-            .execute(named_params![
-                ":block_number": &block_number,
-                ":transactions": &transactions,
-            ])
-            .context("Inserting transaction data")?;
-
-        let events = transaction_data
-            .iter()
-            .filter_map(|data| data.events.as_ref())
-            .flatten();
-        self.insert_block_events(block_number, events)
-            .context("Inserting events into Bloom filter")?;
-
-        Ok(())
-    }
-
-    pub fn update_receipt(
-        &self,
-        block_number: BlockNumber,
-        transaction_idx: usize,
-        receipt: &Receipt,
-    ) -> anyhow::Result<()> {
-        let mut transactions = self
-            .query_transactions_by_block_number(block_number)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("No transactions found for block number {}", block_number)
-            })?;
-        let tx = transactions.get_mut(transaction_idx).ok_or_else(|| {
-            anyhow::anyhow!(
-                "No transaction found at index {} for block number {}",
-                transaction_idx,
-                block_number
-            )
-        })?;
-        tx.1 = Some(receipt.clone());
-        self.update_transactions(block_number, transactions)
-    }
-
-    pub fn update_events(
-        &self,
-        block_number: BlockNumber,
-        transaction_idx: usize,
-        events: &[Event],
-    ) -> anyhow::Result<()> {
-        let mut transactions = self
-            .query_transactions_by_block_number(block_number)?
-            .ok_or_else(|| {
-                anyhow::anyhow!("No transactions found for block number {}", block_number)
-            })?;
-        let tx = transactions.get_mut(transaction_idx).ok_or_else(|| {
-            anyhow::anyhow!(
-                "No transaction found at index {} for block number {}",
-                transaction_idx,
-                block_number
-            )
-        })?;
-        tx.2 = Some(events.to_vec());
-        self.update_transactions(block_number, transactions)
-    }
-
-    pub fn transaction(
-        &self,
-        transaction: TransactionHash,
-    ) -> anyhow::Result<Option<StarknetTransaction>> {
-        let Some((_, transactions)) = self.query_transactions_by_tx_hash(transaction)? else {
-            return Ok(None);
-        };
-        Ok(transactions
-            .into_iter()
-            .find_map(|(tx, ..)| (tx.hash == transaction).then_some(tx)))
-    }
-
-    pub fn transaction_with_receipt(
-        &self,
-        txn_hash: TransactionHash,
-    ) -> anyhow::Result<Option<TransactionWithReceipt>> {
-        let Some((block_number, transactions)) = self.query_transactions_by_tx_hash(txn_hash)?
-        else {
-            return Ok(None);
-        };
-
-        let Some(transaction) = transactions
-            .into_iter()
-            .find(|(tx, ..)| tx.hash == txn_hash)
-        else {
-            return Ok(None);
-        };
-        Ok(Some((
-            transaction.0,
-            transaction
-                .1
-                .ok_or_else(|| anyhow::anyhow!("Receipt missing"))?,
-            transaction
-                .2
-                .ok_or_else(|| anyhow::anyhow!("Events missing"))?,
-            block_number,
-        )))
-    }
-
-    pub fn transaction_at_block(
-        &self,
-        block: BlockId,
-        index: usize,
-    ) -> anyhow::Result<Option<StarknetTransaction>> {
-        let Some(block_number) = self.block_number(block)? else {
-            return Ok(None);
-        };
-        let Some(transactions) = self.query_transactions_by_block_number(block_number)? else {
-            return Ok(None);
-        };
-        Ok(transactions
-            .get(index)
-            .map(|(transaction, ..)| transaction.clone()))
-    }
-
-    pub fn transaction_count(&self, block: BlockId) -> anyhow::Result<usize> {
-        let Some(block_number) = self.block_number(block)? else {
-            return Ok(0);
-        };
-        let Some(transactions) = self.query_transactions_by_block_number(block_number)? else {
-            return Ok(0);
-        };
-        Ok(transactions.len())
-    }
-
-    pub fn transaction_data_for_block(
-        &self,
-        block: BlockId,
-    ) -> anyhow::Result<Option<Vec<TransactionDataForBlock>>> {
-        let Some(block_number) = self.block_number(block)? else {
-            return Ok(None);
-        };
-
-        let Some(transactions) = self.query_transactions_by_block_number(block_number)? else {
-            return Ok(None);
-        };
-
-        let mut result = Vec::new();
-        for (transaction, receipt, events) in transactions {
-            result.push((
-                transaction,
-                receipt.ok_or_else(|| anyhow::anyhow!("Receipt missing"))?,
-                events.ok_or_else(|| anyhow::anyhow!("Events missing"))?,
-            ));
-        }
-        Ok(Some(result))
-    }
-
-    pub fn transactions_for_block(
-        &self,
-        block: BlockId,
-    ) -> anyhow::Result<Option<Vec<StarknetTransaction>>> {
-        let Some(block_number) = self.block_number(block)? else {
-            return Ok(None);
-        };
-
-        Ok(self
-            .query_transactions_by_block_number(block_number)?
-            .map(|transactions| {
-                transactions
+        let transformer = thread::spawn(move || {
+            for (block_number, transactions) in transform_rx.iter() {
+                let len = transactions.len();
+                let transactions: Vec<_> = transactions
                     .into_iter()
-                    .map(|(transaction, ..)| transaction)
-                    .collect()
-            }))
+                    .map(|(tx, receipt, events)| {
+                        let transaction = zstd::decode_all(tx.as_slice())
+                            .context("Decompressing transaction")
+                            .unwrap();
+                        let (transaction, _): (dto::Transaction, _) =
+                            bincode::serde::decode_from_slice(
+                                &transaction,
+                                bincode::config::standard(),
+                            )
+                            .context("Deserializing transaction")
+                            .unwrap();
+                        let receipt = zstd::decode_all(receipt.as_slice())
+                            .context("Decompressing receipt")
+                            .unwrap();
+                        let (receipt, _): (dto::Receipt, _) = bincode::serde::decode_from_slice(
+                            &receipt,
+                            bincode::config::standard(),
+                        )
+                        .context("Deserializing receipt")
+                        .unwrap();
+                        let events = zstd::decode_all(events.as_slice())
+                            .context("Decompressing events")
+                            .unwrap();
+                        let (events, _): (dto::Events, _) =
+                            bincode::serde::decode_from_slice(&events, bincode::config::standard())
+                                .context("Deserializing events")
+                                .unwrap();
+                        dto::TransactionWithReceipt {
+                            transaction,
+                            receipt: Some(receipt),
+                            events: Some(events),
+                        }
+                    })
+                    .collect();
+                let transactions =
+                    bincode::serde::encode_to_vec(transactions, bincode::config::standard())
+                        .context("Serializing transaction")
+                        .unwrap();
+                let transactions = compressor
+                    .compress(&transactions)
+                    .context("Compressing transaction")
+                    .unwrap();
+
+                // Store the updated values.
+                if let Err(err) = insert_tx.send((block_number, transactions, len)) {
+                    panic!("Failed to send transaction: {:?}", err);
+                }
+            }
+        });
+        transformers.push(transformer);
     }
 
-    pub fn events_for_block(&self, block: BlockId) -> anyhow::Result<Option<Vec<EventsForBlock>>> {
-        let Some(block_number) = self.block_number(block)? else {
-            return Ok(None);
-        };
+    let count = tx.query_row("SELECT COUNT(*) FROM starknet_transactions", [], |row| {
+        row.get::<_, i64>(0)
+    })?;
+    tx.execute_batch(
+        r"
+        CREATE TABLE transactions (
+            block_number INTEGER NOT NULL,
+            transactions BLOB NOT NULL
+        );
+        CREATE INDEX transactions_block_number ON transactions(block_number);
+        CREATE TABLE transaction_hashes (
+            hash         BLOB PRIMARY KEY NOT NULL,
+            block_number INTEGER NOT NULL
+        );
+        CREATE INDEX transaction_hashes_block_number ON transaction_hashes(block_number);
+        ",
+    )
+    .context("Creating new tables and indices")?;
+    let mut query_stmt = tx.prepare_cached(
+        r"
+        SELECT hash, tx, block_number, tx, receipt, events FROM starknet_transactions ORDER BY block_number, idx
+        ",
+    )?;
+    let mut insert_transaction_stmt =
+        tx.prepare_cached(r"INSERT INTO transactions (block_number, transactions) VALUES (?, ?)")?;
+    let mut insert_transaction_hash_stmt =
+        tx.prepare_cached(r"INSERT INTO transaction_hashes (hash, block_number) VALUES (?, ?)")?;
+    const BATCH_SIZE: u32 = 100;
 
-        let Some(transactions) = self.query_transactions_by_block_number(block_number)? else {
-            return Ok(None);
-        };
+    const LOG_RATE: Duration = Duration::from_secs(10);
+    let mut last_log = std::time::Instant::now();
 
-        let mut result = Vec::new();
-        for (transaction, _, events) in transactions {
-            let events = events.ok_or_else(|| {
-                anyhow::anyhow!("Events missing for transaction {}", transaction.hash)
-            })?;
-            result.push((transaction.hash, events));
+    let mut rows = query_stmt.query([])?;
+    let mut progress = 0;
+    loop {
+        let mut current_block = 0i64;
+        let mut transactions_in_block = Vec::new();
+        let mut batch_size = 0;
+        loop {
+            match rows.next() {
+                Ok(Some(row)) => {
+                    let hash = row.get_ref_unwrap("hash").as_blob()?;
+                    let block_number = row.get_ref_unwrap("block_number").as_i64()?;
+                    let transaction = row.get_ref_unwrap("tx").as_blob()?.to_vec();
+                    let receipt = row.get_ref_unwrap("receipt").as_blob()?.to_vec();
+                    let events = row.get_ref_unwrap("events").as_blob()?.to_vec();
+                    insert_transaction_hash_stmt.execute(params![hash, block_number])?;
+                    if block_number != current_block {
+                        transform_tx
+                            .send((current_block, mem::take(&mut transactions_in_block)))
+                            .context("Sending transactions to transformer")?;
+                        current_block = block_number;
+                        batch_size += 1;
+                        if batch_size == BATCH_SIZE {
+                            break;
+                        }
+                    }
+                    transactions_in_block.push((transaction, receipt, events));
+                }
+                Ok(None) => break,
+                Err(err) => return Err(err.into()),
+            }
         }
-        Ok(Some(result))
+        for _ in 0..batch_size {
+            let (block_number, transactions, len) = insert_rx.recv()?;
+            insert_transaction_stmt.execute(params![block_number, transactions])?;
+            progress += len;
+        }
+        if last_log.elapsed() > LOG_RATE {
+            last_log = std::time::Instant::now();
+            tracing::info!(
+                "Migrating: {:.2}%",
+                (progress as f64 / count as f64) * 100.0
+            );
+        }
+        if batch_size < BATCH_SIZE {
+            // This was the last batch.
+            break;
+        }
     }
 
-    pub fn transaction_hashes_for_block(
-        &self,
-        block: BlockId,
-    ) -> anyhow::Result<Option<Vec<TransactionHash>>> {
-        let Some(block_number) = self.block_number(block)? else {
-            return Ok(None);
-        };
+    drop(insert_tx);
+    drop(transform_tx);
 
-        let Some(transactions) = self.query_transactions_by_block_number(block_number)? else {
-            return Ok(None);
-        };
-
-        Ok(Some(
-            transactions
-                .into_iter()
-                .map(|(transaction, ..)| transaction.hash)
-                .collect(),
-        ))
+    // Ensure that all transformers have finished successfully.
+    for transformer in transformers {
+        transformer.join().unwrap();
     }
 
-    pub fn transaction_block_hash(
-        &self,
-        hash: TransactionHash,
-    ) -> anyhow::Result<Option<BlockHash>> {
-        self.inner()
-            .query_row(
-                r"
-                SELECT block_headers.hash FROM transaction_hashes
-                JOIN block_headers ON transaction_hashes.block_number = block_headers.number
-                WHERE transaction_hashes.hash = ?
-                ",
-                params![&hash],
-                |row| row.get_block_hash(0),
-            )
-            .optional()
-            .map_err(|e| e.into())
-    }
-
-    fn query_transactions_by_block_number(
-        &self,
-        block_number: BlockNumber,
-    ) -> anyhow::Result<Option<TransactionsRow>> {
-        let mut stmt = self.inner().prepare(
-            r"
-            SELECT transactions
-            FROM transactions
-            WHERE block_number = ?
-            ",
-        )?;
-        let mut rows = stmt.query(params![&block_number])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        let transactions = row.get_blob(0)?;
-        let transactions = zstd::decode_all(transactions).context("Decompressing transactions")?;
-        let transactions: Vec<dto::TransactionsRow> =
-            bincode::serde::decode_from_slice(&transactions, bincode::config::standard())
-                .context("Deserializing transactions")?
-                .0;
-        Ok(Some(
-            transactions
-                .into_iter()
-                .map(
-                    |dto::TransactionsRow {
-                         transaction,
-                         receipt,
-                         events,
-                     }| {
-                        (
-                            transaction.into(),
-                            receipt.map(Into::into),
-                            events.map(|events| match events {
-                                dto::Events::V0 { events } => {
-                                    events.into_iter().map(Into::into).collect()
-                                }
-                            }),
-                        )
-                    },
-                )
-                .collect(),
-        ))
-    }
-
-    fn query_transactions_by_tx_hash(
-        &self,
-        hash: TransactionHash,
-    ) -> anyhow::Result<Option<(BlockNumber, TransactionsRow)>> {
-        let mut stmt = self.inner().prepare(
-            r"
-            SELECT block_number, transactions
-            FROM transactions
-            JOIN transaction_hashes ON transactions.block_number = transaction_hashes.block_number
-            WHERE hash = ?
-            ",
-        )?;
-        let mut rows = stmt.query(params![&hash])?;
-        let Some(row) = rows.next()? else {
-            return Ok(None);
-        };
-        let block_number = row.get_block_number(0)?;
-        let transactions = row.get_blob(1)?;
-        let transactions = zstd::decode_all(transactions).context("Decompressing transactions")?;
-        let transactions: Vec<dto::TransactionsRow> =
-            bincode::serde::decode_from_slice(&transactions, bincode::config::standard())
-                .context("Deserializing transactions")?
-                .0;
-        Ok(Some((
-            block_number,
-            transactions
-                .into_iter()
-                .map(
-                    |dto::TransactionsRow {
-                         transaction,
-                         receipt,
-                         events,
-                     }| {
-                        (
-                            transaction.into(),
-                            receipt.map(Into::into),
-                            events.map(|events| match events {
-                                dto::Events::V0 { events } => {
-                                    events.into_iter().map(Into::into).collect()
-                                }
-                            }),
-                        )
-                    },
-                )
-                .collect(),
-        )))
-    }
-
-    fn update_transactions(
-        &self,
-        block_number: BlockNumber,
-        transactions: TransactionsRow,
-    ) -> anyhow::Result<()> {
-        let mut stmt = self.inner().prepare(
-            r"
-            UPDATE transactions
-            SET transactions = :transactions
-            WHERE block_number = :block_number
-            ",
-        )?;
-        let transactions: Vec<_> = transactions
-            .into_iter()
-            .map(|(transaction, receipt, events)| dto::TransactionsRow {
-                transaction: dto::Transaction::from(&transaction),
-                receipt: receipt.map(|x| dto::Receipt::from(&x)),
-                events: events.map(|events| dto::Events::V0 {
-                    events: events.into_iter().map(|x| x.to_owned().into()).collect(),
-                }),
-            })
-            .collect();
-        let transactions =
-            bincode::serde::encode_to_vec(&transactions, bincode::config::standard())?;
-        let mut compressor = zstd::bulk::Compressor::new(10)?;
-        let transactions = compressor.compress(&transactions)?;
-        stmt.execute(named_params![
-            ":transactions": &transactions,
-            ":block_number": &block_number,
-        ])?;
-        Ok(())
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct TransactionData {
-    pub transaction: StarknetTransaction,
-    pub receipt: Option<Receipt>,
-    pub events: Option<Vec<Event>>,
+    tracing::info!("Dropping old starknet_transactions table");
+    tx.execute("DROP TABLE starknet_transactions", [])?;
+    Ok(())
 }
 
 pub(crate) mod dto {
@@ -936,7 +672,7 @@ pub(crate) mod dto {
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
-    pub struct TransactionsRow {
+    pub struct TransactionWithReceipt {
         pub transaction: Transaction,
         pub receipt: Option<Receipt>,
         pub events: Option<Events>,
@@ -1863,372 +1599,5 @@ pub(crate) mod dto {
                 calldata: Faker.fake_with_rng(rng),
             }
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use pathfinder_common::macro_prelude::*;
-    use pathfinder_common::transaction::*;
-    use pathfinder_common::TransactionVersion;
-    use pathfinder_common::{BlockHeader, TransactionIndex};
-
-    use super::*;
-
-    #[test]
-    fn serialize_deserialize_transaction() {
-        let transaction = pathfinder_common::transaction::Transaction {
-            hash: transaction_hash_bytes!(b"pending tx hash 1"),
-            variant: TransactionVariant::Deploy(DeployTransaction {
-                contract_address: contract_address!("0x1122355"),
-                contract_address_salt: contract_address_salt_bytes!(b"salty"),
-                class_hash: class_hash_bytes!(b"pending class hash 1"),
-                version: TransactionVersion::ONE,
-                ..Default::default()
-            }),
-        };
-        let dto = dto::Transaction::from(&transaction);
-        let serialized = bincode::serde::encode_to_vec(&dto, bincode::config::standard()).unwrap();
-        let deserialized: (dto::Transaction, _) =
-            bincode::serde::decode_from_slice(&serialized, bincode::config::standard()).unwrap();
-        assert_eq!(deserialized.0, dto);
-    }
-
-    fn setup() -> (
-        crate::Connection,
-        BlockHeader,
-        Vec<(StarknetTransaction, Receipt)>,
-    ) {
-        let header = BlockHeader::builder().finalize_with_hash(block_hash_bytes!(b"block hash"));
-
-        // Create one of each transaction type.
-        let transactions = vec![
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"declare v0 tx hash"),
-                variant: TransactionVariant::DeclareV0(DeclareTransactionV0V1 {
-                    class_hash: class_hash_bytes!(b"declare v0 class hash"),
-                    max_fee: fee_bytes!(b"declare v0 max fee"),
-                    nonce: transaction_nonce_bytes!(b"declare v0 tx nonce"),
-                    sender_address: contract_address_bytes!(b"declare v0 contract address"),
-                    signature: vec![
-                        transaction_signature_elem_bytes!(b"declare v0 tx sig 0"),
-                        transaction_signature_elem_bytes!(b"declare v0 tx sig 1"),
-                    ],
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"declare v1 tx hash"),
-                variant: TransactionVariant::DeclareV1(DeclareTransactionV0V1 {
-                    class_hash: class_hash_bytes!(b"declare v1 class hash"),
-                    max_fee: fee_bytes!(b"declare v1 max fee"),
-                    nonce: transaction_nonce_bytes!(b"declare v1 tx nonce"),
-                    sender_address: contract_address_bytes!(b"declare v1 contract address"),
-                    signature: vec![
-                        transaction_signature_elem_bytes!(b"declare v1 tx sig 0"),
-                        transaction_signature_elem_bytes!(b"declare v1 tx sig 1"),
-                    ],
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"declare v2 tx hash"),
-                variant: TransactionVariant::DeclareV2(DeclareTransactionV2 {
-                    class_hash: class_hash_bytes!(b"declare v2 class hash"),
-                    max_fee: fee_bytes!(b"declare v2 max fee"),
-                    nonce: transaction_nonce_bytes!(b"declare v2 tx nonce"),
-                    sender_address: contract_address_bytes!(b"declare v2 contract address"),
-                    signature: vec![
-                        transaction_signature_elem_bytes!(b"declare v2 tx sig 0"),
-                        transaction_signature_elem_bytes!(b"declare v2 tx sig 1"),
-                    ],
-                    compiled_class_hash: casm_hash_bytes!(b"declare v2 casm hash"),
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"deploy tx hash"),
-                variant: TransactionVariant::Deploy(DeployTransaction {
-                    contract_address: contract_address_bytes!(b"deploy contract address"),
-                    contract_address_salt: contract_address_salt_bytes!(
-                        b"deploy contract address salt"
-                    ),
-                    class_hash: class_hash_bytes!(b"deploy class hash"),
-                    constructor_calldata: vec![
-                        constructor_param_bytes!(b"deploy call data 0"),
-                        constructor_param_bytes!(b"deploy call data 1"),
-                    ],
-                    version: TransactionVersion::ZERO,
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"deploy account tx hash"),
-                variant: TransactionVariant::DeployAccountV1(DeployAccountTransactionV1 {
-                    contract_address: contract_address_bytes!(b"deploy account contract address"),
-                    max_fee: fee_bytes!(b"deploy account max fee"),
-                    signature: vec![
-                        transaction_signature_elem_bytes!(b"deploy account tx sig 0"),
-                        transaction_signature_elem_bytes!(b"deploy account tx sig 1"),
-                    ],
-                    nonce: transaction_nonce_bytes!(b"deploy account tx nonce"),
-                    contract_address_salt: contract_address_salt_bytes!(
-                        b"deploy account address salt"
-                    ),
-                    constructor_calldata: vec![
-                        call_param_bytes!(b"deploy account call data 0"),
-                        call_param_bytes!(b"deploy account call data 1"),
-                    ],
-                    class_hash: class_hash_bytes!(b"deploy account class hash"),
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"invoke v0 tx hash"),
-                variant: TransactionVariant::InvokeV0(InvokeTransactionV0 {
-                    calldata: vec![
-                        call_param_bytes!(b"invoke v0 call data 0"),
-                        call_param_bytes!(b"invoke v0 call data 1"),
-                    ],
-                    sender_address: contract_address_bytes!(b"invoke v0 contract address"),
-                    entry_point_selector: entry_point_bytes!(b"invoke v0 entry point"),
-                    entry_point_type: None,
-                    max_fee: fee_bytes!(b"invoke v0 max fee"),
-                    signature: vec![
-                        transaction_signature_elem_bytes!(b"invoke v0 tx sig 0"),
-                        transaction_signature_elem_bytes!(b"invoke v0 tx sig 1"),
-                    ],
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"invoke v1 tx hash"),
-                variant: TransactionVariant::InvokeV1(InvokeTransactionV1 {
-                    calldata: vec![
-                        call_param_bytes!(b"invoke v1 call data 0"),
-                        call_param_bytes!(b"invoke v1 call data 1"),
-                    ],
-                    sender_address: contract_address_bytes!(b"invoke v1 contract address"),
-                    max_fee: fee_bytes!(b"invoke v1 max fee"),
-                    signature: vec![
-                        transaction_signature_elem_bytes!(b"invoke v1 tx sig 0"),
-                        transaction_signature_elem_bytes!(b"invoke v1 tx sig 1"),
-                    ],
-                    nonce: transaction_nonce_bytes!(b"invoke v1 tx nonce"),
-                }),
-            },
-            StarknetTransaction {
-                hash: transaction_hash_bytes!(b"L1 handler tx hash"),
-                variant: TransactionVariant::L1Handler(L1HandlerTransaction {
-                    contract_address: contract_address_bytes!(b"L1 handler contract address"),
-                    entry_point_selector: entry_point_bytes!(b"L1 handler entry point"),
-                    nonce: transaction_nonce_bytes!(b"L1 handler tx nonce"),
-                    calldata: vec![
-                        call_param_bytes!(b"L1 handler call data 0"),
-                        call_param_bytes!(b"L1 handler call data 1"),
-                    ],
-                }),
-            },
-        ];
-
-        // Generate a random receipt for each transaction. Note that these won't make physical sense
-        // but its enough for the tests.
-        let receipts: Vec<pathfinder_common::receipt::Receipt> = transactions
-            .iter()
-            .enumerate()
-            .map(|(i, t)| Receipt {
-                transaction_hash: t.hash,
-                transaction_index: TransactionIndex::new_or_panic(i as u64),
-                ..Default::default()
-            })
-            .collect();
-        assert_eq!(transactions.len(), receipts.len());
-
-        let body = transactions.into_iter().zip(receipts).collect::<Vec<_>>();
-
-        let mut db = crate::StorageBuilder::in_memory()
-            .unwrap()
-            .connection()
-            .unwrap();
-        let db_tx = db.transaction().unwrap();
-
-        db_tx.insert_block_header(&header).unwrap();
-        db_tx
-            .insert_transaction_data(
-                header.number,
-                &body
-                    .clone()
-                    .into_iter()
-                    .map(|(tx, receipt)| TransactionData {
-                        transaction: tx,
-                        receipt: Some(receipt),
-                        events: Some(vec![]),
-                    })
-                    .collect::<Vec<_>>(),
-            )
-            .unwrap();
-
-        db_tx.commit().unwrap();
-
-        (db, header, body)
-    }
-
-    #[test]
-    fn transaction() {
-        let (mut db, _, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let (expected, _) = body.first().unwrap().clone();
-
-        let result = tx.transaction(expected.hash).unwrap().unwrap();
-        assert_eq!(result, expected);
-
-        let invalid = tx.transaction(transaction_hash_bytes!(b"invalid")).unwrap();
-        assert_eq!(invalid, None);
-    }
-
-    #[test]
-    fn transaction_with_receipt() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let (transaction, receipt) = body.first().unwrap().clone();
-
-        let result = tx
-            .transaction_with_receipt(transaction.hash)
-            .unwrap()
-            .unwrap();
-        assert_eq!(result.0, transaction);
-        assert_eq!(result.1, receipt);
-        assert_eq!(result.2, vec![]);
-        assert_eq!(result.3, header.number);
-
-        let invalid = tx
-            .transaction_with_receipt(transaction_hash_bytes!(b"invalid"))
-            .unwrap();
-        assert_eq!(invalid, None);
-    }
-
-    #[test]
-    fn transaction_at_block() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let idx = 5;
-        let expected = Some(body[idx].0.clone());
-
-        let by_number = tx.transaction_at_block(header.number.into(), idx).unwrap();
-        assert_eq!(by_number, expected);
-        let by_hash = tx.transaction_at_block(header.hash.into(), idx).unwrap();
-        assert_eq!(by_hash, expected);
-        let by_latest = tx.transaction_at_block(BlockId::Latest, idx).unwrap();
-        assert_eq!(by_latest, expected);
-
-        let invalid_index = tx
-            .transaction_at_block(header.number.into(), body.len() + 1)
-            .unwrap();
-        assert_eq!(invalid_index, None);
-
-        let invalid_index = tx
-            .transaction_at_block(BlockNumber::MAX.into(), idx)
-            .unwrap();
-        assert_eq!(invalid_index, None);
-    }
-
-    #[test]
-    fn transaction_count() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let by_latest = tx.transaction_count(BlockId::Latest).unwrap();
-        assert_eq!(by_latest, body.len());
-        let by_number = tx.transaction_count(header.number.into()).unwrap();
-        assert_eq!(by_number, body.len());
-        let by_hash = tx.transaction_count(header.hash.into()).unwrap();
-        assert_eq!(by_hash, body.len());
-    }
-
-    #[test]
-    fn transaction_data_for_block() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let expected = Some(
-            body.into_iter()
-                .map(|(tx, receipt)| (tx, receipt, vec![]))
-                .collect(),
-        );
-
-        let by_number = tx.transaction_data_for_block(header.number.into()).unwrap();
-        assert_eq!(by_number, expected);
-        let by_hash = tx.transaction_data_for_block(header.hash.into()).unwrap();
-        assert_eq!(by_hash, expected);
-        let by_latest = tx.transaction_data_for_block(BlockId::Latest).unwrap();
-        assert_eq!(by_latest, expected);
-
-        let invalid_block = tx
-            .transaction_data_for_block(BlockNumber::MAX.into())
-            .unwrap();
-        assert_eq!(invalid_block, None);
-    }
-
-    #[test]
-    fn transactions_for_block() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let expected = Some(body.into_iter().map(|(t, _)| t).collect::<Vec<_>>());
-
-        let by_number = tx.transactions_for_block(header.number.into()).unwrap();
-        assert_eq!(by_number, expected);
-        let by_hash = tx.transactions_for_block(header.hash.into()).unwrap();
-        assert_eq!(by_hash, expected);
-        let by_latest = tx.transactions_for_block(BlockId::Latest).unwrap();
-        assert_eq!(by_latest, expected);
-
-        let invalid_block = tx
-            .transaction_data_for_block(BlockNumber::MAX.into())
-            .unwrap();
-        assert_eq!(invalid_block, None);
-
-        let invalid_block = tx
-            .transaction_data_for_block(block_hash!("0x123").into())
-            .unwrap();
-        assert_eq!(invalid_block, None);
-    }
-
-    #[test]
-    fn transaction_hashes_for_block() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let expected = Some(
-            body.iter()
-                .map(|(transaction, _)| transaction.hash)
-                .collect(),
-        );
-
-        let by_number = tx
-            .transaction_hashes_for_block(header.number.into())
-            .unwrap();
-        assert_eq!(by_number, expected);
-        let by_hash = tx.transaction_hashes_for_block(header.hash.into()).unwrap();
-        assert_eq!(by_hash, expected);
-        let by_latest = tx.transaction_hashes_for_block(BlockId::Latest).unwrap();
-        assert_eq!(by_latest, expected);
-
-        let invalid_block = tx
-            .transaction_hashes_for_block(BlockNumber::MAX.into())
-            .unwrap();
-        assert_eq!(invalid_block, None);
-    }
-
-    #[test]
-    fn transaction_block_hash() {
-        let (mut db, header, body) = setup();
-        let tx = db.transaction().unwrap();
-
-        let target = body.first().unwrap().0.hash;
-        let valid = tx.transaction_block_hash(target).unwrap().unwrap();
-        assert_eq!(valid, header.hash);
-
-        let invalid = tx
-            .transaction_block_hash(transaction_hash_bytes!(b"invalid hash"))
-            .unwrap();
-        assert_eq!(invalid, None);
     }
 }
