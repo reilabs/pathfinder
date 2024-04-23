@@ -9,7 +9,7 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
     let mut transformers = Vec::new();
     let (insert_tx, insert_rx) = mpsc::channel();
     let (transform_tx, transform_rx) =
-        flume::unbounded::<(i64, Vec<(Vec<u8>, Vec<u8>, Vec<u8>)>)>();
+        flume::unbounded::<(i64, Vec<(Vec<u8>, Vec<u8>)>, Vec<Vec<u8>>)>();
     for _ in 0..thread::available_parallelism()
         .map(|p| p.get())
         .unwrap_or(4)
@@ -18,11 +18,11 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
         let transform_rx = transform_rx.clone();
         let mut compressor = zstd::bulk::Compressor::new(10).context("Create zstd compressor")?;
         let transformer = thread::spawn(move || {
-            for (block_number, transactions) in transform_rx.iter() {
+            for (block_number, transactions, events) in transform_rx.iter() {
                 let len = transactions.len();
                 let transactions: Vec<_> = transactions
                     .into_iter()
-                    .map(|(tx, receipt, events)| {
+                    .map(|(tx, receipt)| {
                         let transaction = zstd::decode_all(tx.as_slice())
                             .context("Decompressing transaction")
                             .unwrap();
@@ -42,6 +42,15 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
                         )
                         .context("Deserializing receipt")
                         .unwrap();
+                        dto::TransactionWithReceipt {
+                            transaction,
+                            receipt: Some(receipt),
+                        }
+                    })
+                    .collect();
+                let events: Vec<_> = events
+                    .into_iter()
+                    .map(|events| {
                         let events = zstd::decode_all(events.as_slice())
                             .context("Decompressing events")
                             .unwrap();
@@ -49,11 +58,7 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
                             bincode::serde::decode_from_slice(&events, bincode::config::standard())
                                 .context("Deserializing events")
                                 .unwrap();
-                        dto::TransactionWithReceipt {
-                            transaction,
-                            receipt: Some(receipt),
-                            events: Some(events),
-                        }
+                        events
                     })
                     .collect();
                 let transactions =
@@ -64,9 +69,16 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
                     .compress(&transactions)
                     .context("Compressing transaction")
                     .unwrap();
+                let events = bincode::serde::encode_to_vec(events, bincode::config::standard())
+                    .context("Serializing events")
+                    .unwrap();
+                let events = compressor
+                    .compress(&events)
+                    .context("Compressing events")
+                    .unwrap();
 
                 // Store the updated values.
-                if let Err(err) = insert_tx.send((block_number, transactions, len)) {
+                if let Err(err) = insert_tx.send((block_number, transactions, events, len)) {
                     panic!("Failed to send transaction: {:?}", err);
                 }
             }
@@ -81,7 +93,8 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
         r"
         CREATE TABLE transactions (
             block_number INTEGER NOT NULL,
-            transactions BLOB NOT NULL
+            transactions BLOB NOT NULL,
+            events BLOB
         );
         CREATE INDEX transactions_block_number ON transactions(block_number);
         CREATE TABLE transaction_hashes (
@@ -97,11 +110,12 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
         SELECT hash, tx, block_number, tx, receipt, events FROM starknet_transactions ORDER BY block_number, idx
         ",
     )?;
-    let mut insert_transaction_stmt =
-        tx.prepare_cached(r"INSERT INTO transactions (block_number, transactions) VALUES (?, ?)")?;
+    let mut insert_transaction_stmt = tx.prepare_cached(
+        r"INSERT INTO transactions (block_number, transactions, events) VALUES (?, ?, ?)",
+    )?;
     let mut insert_transaction_hash_stmt =
         tx.prepare_cached(r"INSERT INTO transaction_hashes (hash, block_number) VALUES (?, ?)")?;
-    const BATCH_SIZE: u32 = 100;
+    const BATCH_SIZE: u32 = 10_000;
 
     const LOG_RATE: Duration = Duration::from_secs(10);
     let mut last_log = std::time::Instant::now();
@@ -111,6 +125,7 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
     loop {
         let mut current_block = 0i64;
         let mut transactions_in_block = Vec::new();
+        let mut events_in_block = Vec::new();
         let mut batch_size = 0;
         loop {
             match rows.next() {
@@ -123,7 +138,11 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
                     insert_transaction_hash_stmt.execute(params![hash, block_number])?;
                     if block_number != current_block {
                         transform_tx
-                            .send((current_block, mem::take(&mut transactions_in_block)))
+                            .send((
+                                current_block,
+                                mem::take(&mut transactions_in_block),
+                                mem::take(&mut events_in_block),
+                            ))
                             .context("Sending transactions to transformer")?;
                         current_block = block_number;
                         batch_size += 1;
@@ -131,15 +150,16 @@ pub(crate) fn migrate(tx: &rusqlite::Transaction<'_>) -> anyhow::Result<()> {
                             break;
                         }
                     }
-                    transactions_in_block.push((transaction, receipt, events));
+                    transactions_in_block.push((transaction, receipt));
+                    events_in_block.push(events);
                 }
                 Ok(None) => break,
                 Err(err) => return Err(err.into()),
             }
         }
         for _ in 0..batch_size {
-            let (block_number, transactions, len) = insert_rx.recv()?;
-            insert_transaction_stmt.execute(params![block_number, transactions])?;
+            let (block_number, transactions, events, len) = insert_rx.recv()?;
+            insert_transaction_stmt.execute(params![block_number, transactions, events])?;
             progress += len;
         }
         if last_log.elapsed() > LOG_RATE {
@@ -675,7 +695,6 @@ pub(crate) mod dto {
     pub struct TransactionWithReceipt {
         pub transaction: Transaction,
         pub receipt: Option<Receipt>,
-        pub events: Option<Events>,
     }
 
     #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq, Dummy)]
