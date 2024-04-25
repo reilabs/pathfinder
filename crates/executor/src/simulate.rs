@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -114,18 +114,23 @@ pub fn simulate(
                 };
                 Ok(tx_info)
             });
+
         let state_diff = to_state_diff(&mut tx_state, transaction_declared_deprecated_class_hash)?;
         tx_state.commit();
 
         match tx_info {
             Ok(tx_info) => {
+                // if !state.visited_pcs.is_empty() {
+                //     println!("PC{:#?}", state.visited_pcs.keys());
+                // }
+
                 if let Some(revert_error) = &tx_info.revert_error {
                     tracing::trace!(%revert_error, "Transaction reverted");
                 }
 
                 tracing::trace!(actual_fee=%tx_info.actual_fee.0, actual_resources=?tx_info.actual_resources, "Transaction simulation finished");
 
-                simulations.push(TransactionSimulation {
+                let simulation = TransactionSimulation {
                     fee_estimation: FeeEstimate::from_tx_info_and_gas_price(
                         &tx_info,
                         gas_price,
@@ -133,8 +138,15 @@ pub fn simulate(
                         unit,
                         minimal_l1_gas_amount_vector,
                     ),
-                    trace: to_trace(transaction_type, tx_info, state_diff),
-                });
+                    trace: to_trace(
+                        transaction_type,
+                        tx_info,
+                        state_diff,
+                        state.visited_pcs.clone(),
+                    ),
+                };
+
+                simulations.push(simulation);
             }
             Err(error) => {
                 tracing::debug!(%error, %transaction_idx, "Transaction simulation failed");
@@ -198,7 +210,7 @@ pub fn trace(
         let state_diff = to_state_diff(&mut tx_state, tx_declared_deprecated_class_hash)?;
         tx_state.commit();
 
-        let trace = to_trace(tx_type, tx_info, state_diff);
+        let trace = to_trace(tx_type, tx_info, state_diff, state.visited_pcs.clone());
         traces.push((hash, trace));
     }
 
@@ -329,6 +341,7 @@ fn to_trace(
     transaction_type: TransactionType,
     execution_info: blockifier::transaction::objects::TransactionExecutionInfo,
     state_diff: StateDiff,
+    visited_pcs: HashMap<starknet_api::core::ClassHash, HashSet<usize>>,
 ) -> TransactionTrace {
     let validate_invocation = execution_info.validate_call_info.map(Into::into);
     let maybe_function_invocation = execution_info.execute_call_info.map(Into::into);
@@ -381,6 +394,7 @@ fn to_trace(
             fee_transfer_invocation,
             state_diff,
             execution_resources,
+            visited_pcs,
         }),
         TransactionType::L1Handler => TransactionTrace::L1Handler(L1HandlerTransactionTrace {
             function_invocation: maybe_function_invocation,

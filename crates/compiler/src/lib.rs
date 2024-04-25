@@ -206,6 +206,7 @@ mod v2 {
         type Error = serde_json::Error;
 
         fn try_from(value: FeederGatewayContractClass<'a>) -> Result<Self, Self::Error> {
+            println!("try_from");
             let json = serde_json::json!({
                 "abi": [],
                 "sierra_program": value.sierra_program,
@@ -217,6 +218,7 @@ mod v2 {
     }
 
     pub(super) fn compile(definition: FeederGatewayContractClass<'_>) -> anyhow::Result<Vec<u8>> {
+        println!("Compiler");
         let sierra_class: ContractClass = definition
             .try_into()
             .context("Converting to Sierra class")?;

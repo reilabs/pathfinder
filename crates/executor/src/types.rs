@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use blockifier::{
     execution::call_info::OrderedL2ToL1Message,
@@ -138,6 +138,7 @@ pub struct InvokeTransactionTrace {
     pub fee_transfer_invocation: Option<FunctionInvocation>,
     pub state_diff: StateDiff,
     pub execution_resources: ExecutionResources,
+    pub visited_pcs: HashMap<starknet_api::core::ClassHash, HashSet<usize>>,
 }
 
 #[derive(Debug, Clone)]
