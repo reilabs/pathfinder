@@ -880,8 +880,7 @@ dependencies = [
 [[package]]
 name = "blockifier"
 version = "0.6.0-rc.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c7ed27d8734e64869d24bed5cdcfefd3e069cb1e0d3d07c6e07135cdf226fd94"
+source = "git+https://github.com/reilabs/blockifier.git?rev=594a3317ec7b33f44d2b894a161bd62cae9a72d3#594a3317ec7b33f44d2b894a161bd62cae9a72d3"
 dependencies = [
  "anyhow",
  "ark-ec",
@@ -6113,7 +6112,19 @@ dependencies = [
  "base64 0.13.1",
  "bitvec",
  "bytes",
+ "cairo-lang-casm 2.6.0",
+ "cairo-lang-compiler 2.6.0",
+ "cairo-lang-lowering 2.6.0",
+ "cairo-lang-runner",
+ "cairo-lang-sierra 2.6.0",
+ "cairo-lang-sierra-ap-change 2.6.0",
+ "cairo-lang-sierra-generator 2.6.0",
+ "cairo-lang-sierra-to-casm 2.6.0",
+ "cairo-lang-sierra-type-size",
+ "cairo-lang-starknet 2.6.0",
  "cairo-lang-starknet-classes",
+ "cairo-lang-utils 2.6.0",
+ "cairo-vm",
  "clap",
  "console-subscriber",
  "const-decoder",
@@ -6122,6 +6133,7 @@ dependencies = [
  "futures",
  "http",
  "ipnet",
+ "itertools 0.11.0",
  "jemallocator",
  "lazy_static",
  "metrics",
@@ -6151,6 +6163,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_with",
+ "smol_str 0.2.1",
  "starknet-gateway-client",
  "starknet-gateway-test-fixtures",
  "starknet-gateway-types",
@@ -6295,6 +6308,7 @@ dependencies = [
  "axum",
  "base64 0.13.1",
  "bytes",
+ "cairo-lang-sierra 2.6.0",
  "flate2",
  "futures",
  "hex",
