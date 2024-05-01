@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     sync::{Arc, Mutex},
 };
 
@@ -341,7 +341,7 @@ fn to_trace(
     transaction_type: TransactionType,
     execution_info: blockifier::transaction::objects::TransactionExecutionInfo,
     state_diff: StateDiff,
-    visited_pcs: HashMap<starknet_api::core::ClassHash, HashSet<usize>>,
+    visited_pcs: HashMap<starknet_api::core::ClassHash, Vec<Vec<usize>>>,
 ) -> TransactionTrace {
     let validate_invocation = execution_info.validate_call_info.map(Into::into);
     let maybe_function_invocation = execution_info.execute_call_info.map(Into::into);

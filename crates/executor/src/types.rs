@@ -138,7 +138,7 @@ pub struct InvokeTransactionTrace {
     pub fee_transfer_invocation: Option<FunctionInvocation>,
     pub state_diff: StateDiff,
     pub execution_resources: ExecutionResources,
-    pub visited_pcs: HashMap<starknet_api::core::ClassHash, HashSet<usize>>,
+    pub visited_pcs: HashMap<starknet_api::core::ClassHash, Vec<Vec<usize>>>,
 }
 
 #[derive(Debug, Clone)]
