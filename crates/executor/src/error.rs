@@ -5,6 +5,7 @@ use blockifier::{
     state::errors::StateError,
     transaction::errors::TransactionExecutionError as BlockifierTransactionExecutionError,
 };
+use thiserror::Error;
 
 #[derive(Debug)]
 pub enum CallError {
@@ -70,7 +71,7 @@ impl From<anyhow::Error> for CallError {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Error)]
 pub enum TransactionExecutionError {
     ExecutionError {
         transaction_index: usize,
@@ -98,6 +99,13 @@ impl From<starknet_api::StarknetApiError> for TransactionExecutionError {
 impl From<anyhow::Error> for TransactionExecutionError {
     fn from(value: anyhow::Error) -> Self {
         Self::Internal(value)
+    }
+}
+
+impl std::fmt::Display for TransactionExecutionError {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> Result<(), std::fmt::Error> {
+        // TODO: Improve
+        write!(fmt, "TransactionExecutionError {:?}", self)
     }
 }
 

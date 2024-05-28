@@ -6271,6 +6271,7 @@ dependencies = [
  "serde_json",
  "starknet-gateway-types",
  "starknet_api",
+ "thiserror",
  "tokio",
  "tracing",
 ]
