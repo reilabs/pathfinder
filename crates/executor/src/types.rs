@@ -8,6 +8,7 @@ use pathfinder_common::{
     CasmHash, ClassHash, ContractAddress, ContractNonce, SierraHash, StorageAddress, StorageValue,
 };
 use pathfinder_crypto::Felt;
+use serde::{Deserialize, Serialize};
 
 use super::felt::IntoFelt;
 
@@ -69,7 +70,7 @@ pub enum PriceUnit {
     Fri,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum EntryPointType {
     Constructor,
     External,
@@ -88,7 +89,7 @@ impl TransactionSimulation {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum TransactionTrace {
     Declare(DeclareTransactionTrace),
     DeployAccount(DeployAccountTransactionTrace),
@@ -108,7 +109,7 @@ impl TransactionTrace {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeclareTransactionTrace {
     pub validate_invocation: Option<FunctionInvocation>,
     pub fee_transfer_invocation: Option<FunctionInvocation>,
@@ -116,7 +117,7 @@ pub struct DeclareTransactionTrace {
     pub execution_resources: ExecutionResources,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DeployAccountTransactionTrace {
     pub validate_invocation: Option<FunctionInvocation>,
     pub constructor_invocation: Option<FunctionInvocation>,
@@ -125,13 +126,13 @@ pub struct DeployAccountTransactionTrace {
     pub execution_resources: ExecutionResources,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ExecuteInvocation {
     FunctionInvocation(Option<FunctionInvocation>),
     RevertedReason(String),
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InvokeTransactionTrace {
     pub validate_invocation: Option<FunctionInvocation>,
     pub execute_invocation: ExecuteInvocation,
@@ -141,27 +142,27 @@ pub struct InvokeTransactionTrace {
     pub visited_pcs: HashMap<starknet_api::core::ClassHash, Vec<Vec<usize>>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct L1HandlerTransactionTrace {
     pub function_invocation: Option<FunctionInvocation>,
     pub state_diff: StateDiff,
     pub execution_resources: ExecutionResources,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub enum CallType {
     Call,
     Delegate,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Event {
     pub order: i64,
     pub data: Vec<Felt>,
     pub keys: Vec<Felt>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FunctionInvocation {
     pub calldata: Vec<Felt>,
     pub contract_address: ContractAddress,
@@ -177,7 +178,7 @@ pub struct FunctionInvocation {
     pub computation_resources: ComputationResources,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct MsgToL1 {
     pub order: usize,
     pub payload: Vec<Felt>,
@@ -185,7 +186,7 @@ pub struct MsgToL1 {
     pub from_address: Felt,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StateDiff {
     pub storage_diffs: BTreeMap<ContractAddress, Vec<StorageDiff>>,
     pub deployed_contracts: Vec<DeployedContract>,
@@ -195,37 +196,37 @@ pub struct StateDiff {
     pub replaced_classes: Vec<ReplacedClass>,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct StorageDiff {
     pub key: StorageAddress,
     pub value: StorageValue,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeployedContract {
     pub address: ContractAddress,
     pub class_hash: ClassHash,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DeclaredSierraClass {
     pub class_hash: SierraHash,
     pub compiled_class_hash: CasmHash,
 }
 
-#[derive(Debug, Clone, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ReplacedClass {
     pub contract_address: ContractAddress,
     pub class_hash: ClassHash,
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ExecutionResources {
     pub computation_resources: ComputationResources,
     pub data_availability: DataAvailabilityResources,
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ComputationResources {
     pub steps: usize,
     pub memory_holes: usize,
@@ -265,7 +266,7 @@ impl std::ops::Add for ComputationResources {
     }
 }
 
-#[derive(Debug, Default, Clone, Eq, PartialEq)]
+#[derive(Debug, Default, Clone, Eq, PartialEq, Serialize, Deserialize)]
 pub struct DataAvailabilityResources {
     pub l1_gas: u128,
     pub l1_data_gas: u128,
